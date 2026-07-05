@@ -1,6 +1,6 @@
 {
   "name": "peckboard-pre-igniter-plugin",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "Peckboard pre-igniter WASM plugin (Extism js-pdk / TypeScript)",
   "scripts": {

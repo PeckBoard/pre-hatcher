@@ -42,7 +42,8 @@ to sending the original message untouched.
 | `session.message.before` | Intercept chat messages pre-dispatch (scoped user-authority context). |
 | `mcp.tool.invoke` | Serve `pre_ignite_result` to the temp research agent. |
 
-Permissions: `session_write` (create/tag the temp session), `session_dispatch`
+Permissions: `provide_mcp_tools` (declare `pre_ignite_result`),
+`session_write` (create/tag the temp session), `session_dispatch`
 (`dispatch_capture`, `deliver_message`), `ask_user` (clarifying questions),
 `data_store` (pending-flow records), `user_authority` (act under the user in
 the scoped hook).

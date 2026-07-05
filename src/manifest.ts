@@ -4,7 +4,7 @@
 
 const DESCRIPTION =
   "Pre-igniter: pre-warms chat messages before they reach the main model. A cheaper model (the session provider's lowest-priced one) gathers repository context in a temp session, optionally asks one clarifying question, then delivers the enriched — or untouched — message to the chat.";
-const VERSION = "0.1.0";
+const VERSION = "0.1.1";
 const REPOSITORY = "https://github.com/PeckBoard/pre-igniter";
 
 /// Build the manifest JSON string. `index.ts`'s `manifest()` export wraps this.
@@ -55,6 +55,7 @@ export function manifestJson(): string {
     permissions: [
       "ask_user",
       "data_store",
+      "provide_mcp_tools",
       "session_dispatch",
       "session_write",
       "user_authority",
