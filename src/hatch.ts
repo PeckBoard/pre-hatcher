@@ -5,16 +5,25 @@
 //  1. `session.message.before` fires for an interactive chat message. If the
 //     session's provider has a cheaper model (or the user picked an override
 //     in Settings) and no pre-hatch is already pending, create a temp
-//     research session on that model, dispatch the research prompt, and
-//     Cancel the hook — core parks the message as a `pre-hatch` placeholder
-//     event. The cancel verdict carries `{temp_session_id, model}` so the UI
-//     can stream the research session's actions into the parked bubble.
-//  2. The temp agent researches the repo and calls the `pre_hatch_result`
+//     research session on that model, dispatch the GATEKEEPER prompt (which
+//     holds until the user opts in), and raise the plugin-authored (no AI)
+//     opt-in question on the chat session. The answer is redirected to the
+//     temp session — core resumes a question's target directly and never
+//     re-fires this hook for it, so the temp agent is the only place the
+//     answer can be acted on. Cancel the hook — core parks the message as a
+//     `pre-hatch` placeholder event. The cancel verdict carries
+//     `{temp_session_id, model}` so the UI can stream the temp session's
+//     actions into the parked bubble.
+//  2. The user's answer resumes the temp session. A decline (or dismissal)
+//     makes the agent call `pre_hatch_result` with `pass` immediately, so
+//     the original message is delivered untouched; an accept starts the
+//     research.
+//  3. The temp agent researches the repo and calls the `pre_hatch_result`
 //     MCP tool: `pass` delivers the original message, `enrich` delivers the
 //     context-enriched message, `ask` raises ONE clarifying question on the
 //     chat session (the answer redirects back to the temp session, which then
 //     finishes with pass/enrich).
-//  3. Delivery goes through `peckboard_deliver_message`, which persists the
+//  4. Delivery goes through `peckboard_deliver_message`, which persists the
 //     final `user` event (carrying `pre_hatch: {original, enriched}` so the
 //     UI swaps the placeholder for it), broadcasts, and resumes the chat.
 
@@ -37,10 +46,19 @@ import { truncate } from "./verdict";
 export const PENDING_COLLECTION = "pending";
 export const BY_TEMP_COLLECTION = "by_temp";
 
-/// A pending record older than this is treated as dead (temp agent crashed or
-/// never reported) — a fresh message may pre-hatch again. There is no
-/// user-facing timeout: an in-flight pre-hatch waits as long as it takes.
+/// A pending record older than this is treated as dead (temp agent crashed,
+/// never reported, or the opt-in question was dismissed by typing past it) —
+/// a fresh message may pre-hatch again. There is no user-facing timeout: an
+/// in-flight pre-hatch waits as long as it takes.
 export const STALE_MS = 30 * 60 * 1000;
+
+/// The opt-in question card (plugin-authored, no AI involved). The option
+/// labels also appear verbatim in the answer text core delivers to the temp
+/// session, so `gatekeeperPrompt` branches on them — keep them in sync.
+export const OPT_IN_QUESTION =
+  "Expand this message with repository context before sending it to the main model?";
+export const OPT_IN_YES = "Yes, expand it";
+export const OPT_IN_NO = "No, send as-is";
 
 // ── Pure helpers (vitest-covered) ──────────────────────────────────────
 
@@ -155,12 +173,39 @@ export function researchPrompt(text: string): string {
   ].join("\n");
 }
 
+/// The prompt the temp session is dispatched with while the user answers the
+/// opt-in question. The first turn must do NOTHING — the user may decline,
+/// and any research done before the answer would be wasted spend. The answer
+/// (redirected here by the question's `redirectSessionId`) arrives as the
+/// next message and either starts the research or reports `pass` so the
+/// original message is delivered untouched.
+export function gatekeeperPrompt(text: string): string {
+  return [
+    "HOLD — do not start working yet. The user is being asked whether this",
+    "message should be expanded with repository context, and may decline.",
+    "THIS TURN: do NOT call pre_hatch_result and do NOT use any other tool —",
+    "reply with exactly: ok. Everything below applies only AFTER the user's",
+    "answer arrives as your next message:",
+    `- If the answer contains "${OPT_IN_YES}": follow the instructions below`,
+    "  from the beginning.",
+    `- If it contains "${OPT_IN_NO}", or the user dismissed the question, or`,
+    "  it is anything else: immediately call the `pre_hatch_result` MCP tool",
+    '  with {"action":"pass"} and do nothing else — the user\'s message must',
+    "  never be left undelivered.",
+    "",
+    researchPrompt(text),
+  ].join("\n");
+}
+
 // ── Handlers (host-touching) ───────────────────────────────────────────
 
 /// `session.message.before`: decide whether to take ownership of the turn.
 /// Returns a verdict object; `lib.ts` serializes it. A cancel carries `data`
 /// (temp session id + model) that core copies onto the `pre-hatch`
-/// placeholder event so the UI can follow the research live. Any internal
+/// placeholder event so the UI can follow the temp session live. The temp
+/// session is dispatched holding (see `gatekeeperPrompt`) and the opt-in
+/// question is raised on the chat session with the answer redirected to the
+/// temp session; no model does any work until the user accepts. Any internal
 /// failure falls back to `{skip}` so the user's message always proceeds.
 export function handleMessageBefore(payload: any): {
   verdict: string;
@@ -198,6 +243,17 @@ export function handleMessageBefore(payload: any): {
       session_id: tempId,
       data: { chat_session_id: sessionId, original_text: text },
     });
+    // Ask BEFORE storing the pending records or dispatching: if the question
+    // cannot be raised (e.g. headless — no live host), the throw lands in the
+    // catch below and the message dispatches normally, leaving nothing behind
+    // but an idle, never-dispatched temp session.
+    askUser({
+      session_id: sessionId,
+      question: OPT_IN_QUESTION,
+      options: [OPT_IN_YES, OPT_IN_NO],
+      token: genId(),
+      redirect_session_id: tempId,
+    });
     storePut({
       collection: PENDING_COLLECTION,
       key: sessionId,
@@ -208,10 +264,10 @@ export function handleMessageBefore(payload: any): {
       key: tempId,
       data: { chat_session_id: sessionId, original_text: text },
     });
-    dispatchCapture({ session_id: tempId, prompt: researchPrompt(text) });
+    dispatchCapture({ session_id: tempId, prompt: gatekeeperPrompt(text) });
     return {
       verdict: "cancel",
-      reason: `pre-hatching: gathering context on ${cheapModel} before dispatch`,
+      reason: `pre-hatch offered: expands with context gathered on ${cheapModel} if accepted`,
       data: { temp_session_id: tempId, model: cheapModel },
     };
   } catch (_e) {

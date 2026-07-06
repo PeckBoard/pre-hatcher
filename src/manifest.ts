@@ -3,8 +3,8 @@
 // require.
 
 const DESCRIPTION =
-  "Pre-hatcher: pre-warms chat messages before they reach the main model. A cheaper model (the session provider's lowest-priced one, or the model picked in Settings) gathers repository context in a temp session, optionally asks one clarifying question, then delivers the enriched — or untouched — message to the chat.";
-const VERSION = "0.2.1";
+  "Pre-hatcher: pre-warms chat messages before they reach the main model. Each intercepted message starts with a plain opt-in question card (no AI involved) — declining sends the message unchanged; accepting has a cheaper model (the session provider's lowest-priced one, or the model picked in Settings) gather repository context in a temp session, optionally ask one clarifying question, then deliver the enriched — or untouched — message to the chat.";
+const VERSION = "0.2.2";
 const REPOSITORY = "https://github.com/PeckBoard/pre-hatcher";
 
 /// Build the manifest JSON string. `index.ts`'s `manifest()` export wraps this.

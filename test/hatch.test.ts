@@ -1,8 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
+  OPT_IN_NO,
+  OPT_IN_YES,
   STALE_MS,
   baseModel,
   finalEnriched,
+  gatekeeperPrompt,
   isStale,
   researchPrompt,
   shouldIntercept,
@@ -112,5 +115,22 @@ describe("researchPrompt", () => {
     // The prompt must tell the model enforcement is server-side, not
     // just advisory.
     expect(p).toContain("the server refuses them");
+  });
+});
+
+describe("gatekeeperPrompt", () => {
+  it("holds the first turn and embeds the full research prompt", () => {
+    const p = gatekeeperPrompt("fix the login bug");
+    expect(p).toContain("do NOT call pre_hatch_result");
+    expect(p).toContain("reply with exactly: ok");
+    expect(p).toContain(researchPrompt("fix the login bug"));
+  });
+
+  it("branches on the exact opt-in option labels and declines to pass", () => {
+    const p = gatekeeperPrompt("fix the login bug");
+    expect(p).toContain(OPT_IN_YES);
+    expect(p).toContain(OPT_IN_NO);
+    // A decline or dismissal must deliver the original, never drop it.
+    expect(p).toContain('{"action":"pass"}');
   });
 });

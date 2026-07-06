@@ -1,10 +1,11 @@
 # Peckboard pre-hatcher plugin
 
 Pre-warms interactive chat messages **before** they reach the main (expensive)
-model: a temp session on a cheaper model (the provider's cheapest priced one,
-or the model picked in Settings → Pre-hatcher) gathers repository context,
-optionally asks the user one clarifying question, and then delivers the
-enriched — or untouched — message to the chat session.
+model. Each intercepted message first gets a plain opt-in question card (no AI
+involved); on acceptance a temp session on a cheaper model (the provider's
+cheapest priced one, or the model picked in Settings → Pre-hatcher) gathers
+repository context, optionally asks the user one clarifying question, and then
+delivers the enriched — or untouched — message to the chat session.
 
 ## Flow
 
@@ -16,11 +17,19 @@ enriched — or untouched — message to the chat session.
    there is no cheaper model, the message is trivially short, or a
    pre-hatch is already in flight for that chat; otherwise it creates a temp
    research session (`is_expert`, kind `pre-hatcher`) on the cheap model,
-   dispatches the research prompt, and cancels the hook with
-   `data: {temp_session_id, model}`. Core parks the message as a `pre-hatch`
-   placeholder event carrying that data — the UI renders the user's text
-   with a live feed of the research session's actions.
-2. **Research** — the temp agent reads the repo (outline/search/targeted
+   dispatches the gatekeeper prompt (the agent replies `ok` and holds — no
+   research yet), raises the plugin-authored opt-in question on the chat
+   session ("Expand this message with repository context…?"), and cancels
+   the hook with `data: {temp_session_id, model}`. Core parks the message as
+   a `pre-hatch` placeholder event carrying that data — the UI renders the
+   user's text with a live feed of the temp session's actions.
+2. **Opt-in** — the user's answer is redirected to the temp session
+   (`redirectSessionId` on the question event): core resumes a question's
+   target directly and never re-fires the hook, so the temp agent is the
+   only place the answer can be acted on. "No, send as-is" (or a dismissal)
+   makes it report `pass` immediately — the original message is delivered
+   untouched, no research spend; "Yes, expand it" starts the research.
+3. **Research** — on acceptance the temp agent reads the repo (outline/search/targeted
    reads only) and reports through the `pre_hatch_result` MCP tool:
    - `pass` — the message is fine as-is;
    - `enrich` — send `message` instead: the original message verbatim plus a
@@ -28,16 +37,18 @@ enriched — or untouched — message to the chat session.
    - `ask` — raise ONE clarifying question on the chat session. The answer is
      redirected to the temp session (`redirectSessionId` on the question
      event), which then finishes with `enrich`/`pass`.
-3. **Deliver** — `peckboard_deliver_message` persists the final `user` event
+4. **Deliver** — `peckboard_deliver_message` persists the final `user` event
    (data carries `pre_hatch: {original, enriched}` so the UI swaps the
    placeholder for the final message, original expandable), broadcasts it,
    and resumes the chat session so the main model runs on the enriched text.
 
 There is **no timeout**: an in-flight pre-hatch waits as long as the research
+There is **no timeout**: an accepted pre-hatch waits as long as the research
 takes. A pending record older than 30 minutes is treated as dead (crashed temp
-agent) and replaced on the next message; enrichment failures always fall back
-to sending the original message untouched.
-
+agent, or a question the user typed past — typing a new message dismisses the
+card without resuming the temp agent, leaving the parked message undelivered)
+and replaced on the next message; enrichment failures always fall back to
+sending the original message untouched.
 ## Hooks & permissions
 
 | Hook | Why |
