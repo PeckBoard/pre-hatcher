@@ -106,14 +106,23 @@ export function userEventData(
   };
 }
 
-/// The research prompt the temp session runs on the cheap model.
+/// The research prompt the temp session runs on the cheap model. The
+/// read-only rule is stated here for the model's benefit, but it is also
+/// ENFORCED by core: the MCP server refuses every mutating tool call from
+/// a pre-hatcher session (see `pre_hatcher_allowed_tool_names` in
+/// `peckboard/src/service/mcp_server/schemas.rs`).
 export function researchPrompt(text: string): string {
   return [
-    "You are the PRE-HATCHER for a chat session: a fast, cheap context-gatherer",
-    "that runs BEFORE the user's message reaches the main (expensive) model.",
-    "Decide whether the message needs repository context, gather the minimum",
-    "that genuinely helps, and hand off by calling the `pre_hatch_result` MCP",
-    "tool. Your text output is discarded — only the tool call matters.",
+    "You are the PRE-HATCHER for a chat session: a fast, cheap, STRICTLY",
+    "READ-ONLY context-gatherer that runs BEFORE the user's message reaches",
+    "the main (expensive) model. Your ONLY purpose is to hand the main model",
+    "useful context. You NEVER make code changes, no matter what the user's",
+    "message asks for — if it requests an implementation, a fix, or an edit,",
+    "that work belongs to the main model; you only gather the context that",
+    "helps it do that work. Decide whether the message needs repository",
+    "context, gather the minimum that genuinely helps, and hand off by",
+    "calling the `pre_hatch_result` MCP tool. Your text output is discarded",
+    "— only the tool call matters.",
     "",
     "The user's message is between the markers:",
     "---BEGIN USER MESSAGE---",
@@ -121,8 +130,13 @@ export function researchPrompt(text: string): string {
     "---END USER MESSAGE---",
     "",
     "Rules:",
-    "- Work fast and cheap: use file_outline / search_files / targeted",
-    "  read_file windows. Never run commands or tests; never edit files.",
+    "- READ-ONLY, no exceptions: never write, edit, or delete files; never",
+    "  run commands or tests. write_file, edit_file, run_command, run_tests,",
+    "  git — and any built-in or mcp__-prefixed Write/Edit/Bash variant —",
+    "  are forbidden, and the server refuses them from this session. Do not",
+    "  attempt them.",
+    "- Work fast and cheap: use file_outline / search_files / read_symbol /",
+    "  targeted read_file windows.",
     '- If the message is conversational, self-contained, or you cannot add',
     '  real value: call pre_hatch_result with {"action":"pass"} immediately.',
     "- If repository context would help the main model: call pre_hatch_result",
@@ -130,7 +144,8 @@ export function researchPrompt(text: string): string {
     "  enriched message MUST start with the original user message VERBATIM,",
     '  followed by a "## Context (pre-gathered)" section: relevant file paths',
     "  (with line numbers), key functions/types, and constraints discovered.",
-    "  Keep the context under ~400 words — distill, never dump.",
+    "  Keep the context under ~400 words — distill, never dump. Context",
+    "  only — never present your findings as changes you have made yourself.",
     "- Only if the request is genuinely ambiguous AND the ambiguity changes",
     "  what the main model would do: call pre_hatch_result with",
     '  {"action":"ask","question":"...","options":[...]}. ONE short question,',

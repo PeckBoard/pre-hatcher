@@ -1,6 +1,6 @@
 {
   "name": "peckboard-pre-hatcher-plugin",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "description": "Peckboard pre-hatcher WASM plugin (Extism js-pdk / TypeScript)",
   "scripts": {

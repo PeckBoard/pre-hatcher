@@ -100,4 +100,17 @@ describe("researchPrompt", () => {
     expect(p).toContain("---END USER MESSAGE---");
     expect(p).toContain("pre_hatch_result");
   });
+
+  it("declares the session read-only, context-only, and names the blocked tools", () => {
+    const p = researchPrompt("fix the login bug");
+    expect(p).toContain("READ-ONLY");
+    expect(p).toContain("NEVER make code changes");
+    expect(p).toContain("that work belongs to the main model");
+    for (const tool of ["write_file", "edit_file", "run_command", "run_tests"]) {
+      expect(p).toContain(tool);
+    }
+    // The prompt must tell the model enforcement is server-side, not
+    // just advisory.
+    expect(p).toContain("the server refuses them");
+  });
 });
