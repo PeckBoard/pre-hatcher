@@ -47,6 +47,7 @@ import {
   storeDelete,
   storeGet,
   storePut,
+  terminateAgent,
 } from "./host";
 import { truncate } from "./verdict";
 
@@ -123,22 +124,51 @@ export function finalEnriched(original: string, message: string): string {
 /// The `user` event data persisted on delivery. `text` is what the UI renders
 /// in place of the user's message; `pre_hatch` carries the original for the
 /// expandable "original message" view and links the temp session for audit.
+/// `cancelled` marks a delivery forced by the user cancelling the pre-hatch.
 export function userEventData(
   text: string,
   original: string,
   enriched: boolean,
   tempSessionId: string,
+  cancelled = false,
 ): any {
-  return {
-    text,
-    pre_hatch: {
-      original,
-      enriched,
-      temp_session_id: tempSessionId,
-    },
+  const pre_hatch: any = {
+    original,
+    enriched,
+    temp_session_id: tempSessionId,
   };
+  if (cancelled) {
+    pre_hatch.cancelled = true;
+  }
+  return { text, pre_hatch };
 }
 
+/// What a `session.prehatch.cancel` should do given the chat's pending
+/// record: `deliver` the recorded original untouched; `not-pending` when
+/// nothing is in flight or the record belongs to a newer pre-hatch that
+/// superseded the cancelled one (core must NOT deliver a second copy
+/// either); `fallback` when the record is unusable — clean it up and let
+/// core deliver from the parked event's own text.
+export function cancelPlan(
+  pending: any,
+  tempSessionId: string,
+): "deliver" | "not-pending" | "fallback" {
+  if (!pending) {
+    return "not-pending";
+  }
+  const recorded =
+    typeof pending?.temp_session_id === "string" ? pending.temp_session_id : "";
+  if (tempSessionId !== "" && recorded !== "" && recorded !== tempSessionId) {
+    return "not-pending";
+  }
+  if (
+    typeof pending?.original_text !== "string" ||
+    pending.original_text.trim() === ""
+  ) {
+    return "fallback";
+  }
+  return "deliver";
+}
 /// The research prompt the temp session runs on the cheap model. The
 /// read-only rule is stated here for the model's benefit, but it is also
 /// ENFORCED by core: the MCP server refuses every mutating tool call from
@@ -272,6 +302,9 @@ export function handleMessageBefore(payload: any): {
     if (pending && !isStale(pending, nowMs())) {
       return { verdict: "skip" };
     }
+    if (pending) {
+      try { terminateAgent({ session_id: pending.temp_session_id }); } catch (_e) { /* best-effort */ }
+    }
 
     const created = createSession({
       name: `Pre-hatcher: ${truncate(text, 40)}`,
@@ -321,6 +354,56 @@ export function handleMessageBefore(payload: any): {
   }
 }
 
+/// `session.prehatch.cancel`: the user cancelled the pre-hatch parked on
+/// `session_id`. Core has already terminated the temp research agent and
+/// dismissed the question cards; our job is to clear the pending records and
+/// deliver the parked original message untouched. Returns a cancel verdict
+/// whenever this plugin owned the outcome (delivered now, or nothing left to
+/// do) — core treats anything else as "not handled" and delivers the
+/// original itself, so `skip` is reserved for delivery failure.
+export function handleHatchCancel(payload: any): {
+  verdict: string;
+  reason?: string;
+  data?: any;
+} {
+  const chatId = asStr(payload?.session_id);
+  if (chatId === "") {
+    return { verdict: "skip" };
+  }
+  const pending = tryGet(PENDING_COLLECTION, chatId);
+  const plan = cancelPlan(pending, asStr(payload?.temp_session_id));
+  if (plan === "not-pending") {
+    return {
+      verdict: "cancel",
+      reason: "no matching pre-hatch pending — nothing left to cancel",
+      data: { delivered: "none" },
+    };
+  }
+  const tempId = asStr(pending.temp_session_id);
+  if (plan === "fallback") {
+    cleanup(chatId, tempId);
+    return { verdict: "skip" };
+  }
+  const original = asStr(pending.original_text);
+  try {
+    deliverMessage({
+      session_id: chatId,
+      text: original,
+      data: userEventData(original, original, false, tempId, true),
+    });
+  } catch (_e) {
+    // Could not deliver: clear the records so the chat isn't blocked and
+    // skip so core's fallback delivery sends the original instead.
+    cleanup(chatId, tempId);
+    return { verdict: "skip" };
+  }
+  cleanup(chatId, tempId);
+  return {
+    verdict: "cancel",
+    reason: "pre-hatch cancelled: original message delivered untouched",
+    data: { delivered: "original" },
+  };
+}
 /// The `pre_hatch_result` MCP tool, called by the temp research agent.
 export function preHatchResult(args: any, callerSessionId: string): any {
   const link = tryGet(BY_TEMP_COLLECTION, callerSessionId);

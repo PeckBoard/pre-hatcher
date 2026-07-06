@@ -57,11 +57,19 @@ card without resuming the temp agent, leaving the parked message undelivered)
 and replaced on the next message; enrichment failures always fall back to
 sending the original message untouched.
 
+An in-flight pre-hatch can also be **cancelled** from the parked bubble
+(`POST /api/sessions/:id/prehatch-cancel`): core terminates the temp research
+agent and dismisses any question card, then fires `session.prehatch.cancel` —
+the plugin clears its pending records and delivers the original message
+untouched through its normal path (a `cancel` verdict; `skip` makes core
+deliver the original itself so the message is never lost).
+
 ## Hooks & permissions
 
 | Hook | Why |
 | --- | --- |
 | `session.message.before` | Intercept chat messages pre-dispatch (scoped user-authority context). |
+| `session.prehatch.cancel` | Clean up + deliver the original when the user cancels a pre-hatch. |
 | `mcp.tool.invoke` | Serve `pre_hatch_result` to the temp research agent. |
 
 (`dispatch_capture`, `deliver_message`), `ask_user` (opt-in, approval, and

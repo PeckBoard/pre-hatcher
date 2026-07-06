@@ -7,6 +7,7 @@ import {
   STALE_MS,
   approvalQuestion,
   baseModel,
+  cancelPlan,
   finalEnriched,
   gatekeeperPrompt,
   isApproved,
@@ -87,6 +88,16 @@ describe("userEventData", () => {
   });
 });
 
+  it("marks a cancelled delivery without touching the normal shape", () => {
+    const d = userEventData("original", "original", false, "temp-1", true);
+    expect(d.pre_hatch.cancelled).toBe(true);
+    expect(d.pre_hatch.enriched).toBe(false);
+    // The flag is absent — not false — on ordinary deliveries, so old
+    // readers see the exact shape they always did.
+    const plain = userEventData("original", "original", false, "temp-1");
+    expect("cancelled" in plain.pre_hatch).toBe(false);
+  });
+
 describe("cancel", () => {
   it("carries structured data when given, and omits it when not", () => {
     const bare = JSON.parse(cancel("pre-hatching"));
@@ -162,5 +173,28 @@ describe("isApproved", () => {
     expect(isApproved({ status: "pending" })).toBe(false);
     expect(isApproved({ status: "unknown" })).toBe(false);
     expect(isApproved(null)).toBe(false);
+  });
+});
+
+describe("cancelPlan", () => {
+  const pending = { temp_session_id: "temp-1", original_text: "fix the login bug" };
+
+  it("delivers the recorded original for the matching pre-hatch", () => {
+    expect(cancelPlan(pending, "temp-1")).toBe("deliver");
+    // A cancel that doesn't name a temp session (legacy event) still hits
+    // the chat's only pending record.
+    expect(cancelPlan(pending, "")).toBe("deliver");
+  });
+
+  it("does nothing when no record is pending or a newer pre-hatch owns it", () => {
+    expect(cancelPlan(null, "temp-1")).toBe("not-pending");
+    expect(cancelPlan(pending, "temp-2")).toBe("not-pending");
+  });
+
+  it("falls back to core delivery when the record is unusable", () => {
+    expect(cancelPlan({ temp_session_id: "temp-1" }, "temp-1")).toBe("fallback");
+    expect(cancelPlan({ temp_session_id: "temp-1", original_text: "  " }, "temp-1")).toBe(
+      "fallback",
+    );
   });
 });

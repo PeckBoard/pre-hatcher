@@ -3,8 +3,8 @@
 // require.
 
 const DESCRIPTION =
-  "Pre-hatcher: pre-warms chat messages before they reach the main model. Each intercepted message starts with a plain opt-in question card (no AI involved) — declining sends the message unchanged; accepting has a cheaper model (the session provider's lowest-priced one, or the model picked in Settings) gather repository context in a temp session, optionally ask one clarifying question, and propose an enriched message that is delivered only after the user approves it on a second plain question card (declining delivers the original).";
-const VERSION = "0.2.3";
+  "Pre-hatcher: pre-warms chat messages before they reach the main model. Each intercepted message starts with a plain opt-in question card (no AI involved) — declining sends the message unchanged; accepting has a cheaper model (the session provider's lowest-priced one, or the model picked in Settings) gather repository context in a temp session, optionally ask one clarifying question, and propose an enriched message that is delivered only after the user approves it on a second plain question card (declining delivers the original). An in-flight pre-hatch can be cancelled from its chat bubble: the research agent is stopped and the original message is sent untouched.";
+const VERSION = "0.3.0";
 const REPOSITORY = "https://github.com/PeckBoard/pre-hatcher";
 
 /// Build the manifest JSON string. `index.ts`'s `manifest()` export wraps this.
@@ -14,7 +14,11 @@ export function manifestJson(): string {
     version: VERSION,
     repository: REPOSITORY,
 
-    hooks: ["session.message.before", "mcp.tool.invoke"],
+    hooks: [
+      "session.message.before",
+      "session.prehatch.cancel",
+      "mcp.tool.invoke",
+    ],
 
     mcp_tools: [
       {
@@ -58,6 +62,7 @@ export function manifestJson(): string {
       "provide_mcp_tools",
       "session_dispatch",
       "session_write",
+      "session_control",
       "user_authority",
     ],
   };

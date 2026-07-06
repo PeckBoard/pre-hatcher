@@ -93,3 +93,7 @@ export function genId(): string {
 export function nowMs(): number {
   return Date.now();
 }
+
+export function terminateAgent(input: { session_id: string }): any {
+  return hostCall("peckboard_terminate_agent", input);
+}
