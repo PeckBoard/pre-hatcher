@@ -6,12 +6,16 @@ import {
   OPT_IN_NO,
   OPT_IN_YES,
   PENDING_COLLECTION,
+  PHASE_AWAIT_APPROVAL,
+  PHASE_AWAIT_CLARIFY,
+  PHASE_OPT_IN,
+  PHASE_RESEARCH,
   STALE_MS,
   approvalQuestion,
   baseModel,
   cancelPlan,
   finalEnriched,
-  gatekeeperPrompt,
+  handleAnswer,
   isApproved,
   isStale,
   preHatchResult,
@@ -30,7 +34,7 @@ const h = vi.hoisted(() => ({
     deliver: [] as any[],
     ask: [] as any[],
     dispatch: [] as any[],
-    answer: { status: "pending" } as any,
+    terminate: [] as any[],
   },
 }));
 
@@ -59,10 +63,12 @@ vi.mock("../src/host", () => ({
     h.calls.dispatch.push(i);
     return {};
   }),
-  getAnswer: vi.fn(() => h.calls.answer),
   createSession: vi.fn(() => ({ session: { id: "temp-1" } })),
   sessionMetaSet: vi.fn(() => ({})),
-  terminateAgent: vi.fn(() => ({})),
+  terminateAgent: vi.fn((i: any) => {
+    h.calls.terminate.push(i);
+    return {};
+  }),
   genId: vi.fn(() => "tok-1"),
   nowMs: vi.fn(() => 1000),
 }));
@@ -135,7 +141,6 @@ describe("userEventData", () => {
     expect(d.pre_hatch.enriched).toBe(true);
     expect(d.pre_hatch.temp_session_id).toBe("temp-1");
   });
-});
 
   it("marks a cancelled delivery without touching the normal shape", () => {
     const d = userEventData("original", "original", false, "temp-1", true);
@@ -146,6 +151,7 @@ describe("userEventData", () => {
     const plain = userEventData("original", "original", false, "temp-1");
     expect("cancelled" in plain.pre_hatch).toBe(false);
   });
+});
 
 describe("cancel", () => {
   it("carries structured data when given, and omits it when not", () => {
@@ -180,22 +186,11 @@ describe("researchPrompt", () => {
     // just advisory.
     expect(p).toContain("the server refuses them");
   });
-});
 
-describe("gatekeeperPrompt", () => {
-  it("holds the first turn and embeds the full research prompt", () => {
-    const p = gatekeeperPrompt("fix the login bug");
-    expect(p).toContain("do NOT call pre_hatch_result");
-    expect(p).toContain("reply with exactly: ok");
-    expect(p).toContain(researchPrompt("fix the login bug"));
-  });
-
-  it("branches on the exact opt-in option labels and declines to pass", () => {
-    const p = gatekeeperPrompt("fix the login bug");
-    expect(p).toContain(OPT_IN_YES);
-    expect(p).toContain(OPT_IN_NO);
-    // A decline or dismissal must deliver the original, never drop it.
-    expect(p).toContain('{"action":"pass"}');
+  it("tells the model it is DONE after enrich — no finalize round-trip", () => {
+    const p = researchPrompt("fix the login bug");
+    expect(p).toContain("After you call enrich you are DONE");
+    expect(p).not.toContain("finalize");
   });
 });
 
@@ -212,16 +207,14 @@ describe("approvalQuestion", () => {
 
 describe("isApproved", () => {
   it("approves only an explicit, unrejected 'send expanded' answer", () => {
-    expect(isApproved({ status: "answered", rejected: false, answer: APPROVE_SEND })).toBe(true);
-    expect(isApproved({ status: "answered", answer: APPROVE_SEND })).toBe(true);
+    expect(isApproved(APPROVE_SEND, false)).toBe(true);
   });
 
   it("falls back to the original on decline, dismissal, or anything else", () => {
-    expect(isApproved({ status: "answered", answer: APPROVE_ORIGINAL })).toBe(false);
-    expect(isApproved({ status: "answered", rejected: true, answer: APPROVE_SEND })).toBe(false);
-    expect(isApproved({ status: "pending" })).toBe(false);
-    expect(isApproved({ status: "unknown" })).toBe(false);
-    expect(isApproved(null)).toBe(false);
+    expect(isApproved(APPROVE_ORIGINAL, false)).toBe(false);
+    expect(isApproved(APPROVE_SEND, true)).toBe(false);
+    expect(isApproved("", true)).toBe(false);
+    expect(isApproved("something else", false)).toBe(false);
   });
 });
 
@@ -273,30 +266,93 @@ describe("researchPrompt with session context", () => {
   });
 });
 
-describe("gatekeeperPrompt threads history into the research prompt", () => {
-  it("embeds the history-carrying research prompt", () => {
-    const history = "User: prior\n\nAssistant: reply";
-    const p = gatekeeperPrompt("fix that", history);
-    expect(p).toContain(researchPrompt("fix that", history));
-    expect(p).toContain("prior");
-  });
-});
-
-describe("preHatchResult stops after generating the hatched prompt", () => {
+// The end-to-end control flow: the tool reports research; every yes/no
+// decision and the actual delivery happen in CODE, in `handleAnswer`.
+describe("pre-hatch control flow is decided in code, not by the model", () => {
   beforeEach(() => {
     h.store.clear();
     h.calls.deliver.length = 0;
     h.calls.ask.length = 0;
     h.calls.dispatch.length = 0;
-    h.calls.answer = { status: "pending" };
+    h.calls.terminate.length = 0;
     vi.clearAllMocks();
   });
 
-  it("enrich proposes, finalize delivers the hatched prompt once, then the flow is over", () => {
-    // The link a live pre-hatch would have stored before the temp agent runs.
+  function seedOptIn(temp: string, chat: string, text: string, history = "") {
+    h.store.set(`${BY_TEMP_COLLECTION}:${temp}`, {
+      chat_session_id: chat,
+      original_text: text,
+      history,
+      phase: PHASE_OPT_IN,
+      token: "tok-opt",
+    });
+    h.store.set(`${PENDING_COLLECTION}:${chat}`, {
+      temp_session_id: temp,
+      original_text: text,
+      created_ms: 1000,
+    });
+  }
+
+  it("opt-in accept dispatches read-only research in code and delivers nothing yet", () => {
+    seedOptIn("temp-9", "chat-9", "refactor the parser", "prior turns");
+    const v = handleAnswer({
+      chat_session_id: "chat-9",
+      temp_session_id: "temp-9",
+      token: "tok-opt",
+      answer: OPT_IN_YES,
+      rejected: false,
+    });
+    expect(v.verdict).toBe("cancel");
+    expect(h.calls.deliver).toHaveLength(0);
+    expect(h.calls.dispatch).toHaveLength(1);
+    expect(h.calls.dispatch[0].session_id).toBe("temp-9");
+    expect(h.calls.dispatch[0].prompt).toContain("---BEGIN USER MESSAGE---");
+    expect(h.calls.dispatch[0].prompt).toContain("refactor the parser");
+    expect(h.calls.dispatch[0].prompt).toContain("prior turns");
+    const rec = h.store.get(`${BY_TEMP_COLLECTION}:temp-9`) as any;
+    expect(rec.phase).toBe(PHASE_RESEARCH);
+  });
+
+  it("opt-in decline delivers the original untouched and stops the temp agent", () => {
+    seedOptIn("temp-8", "chat-8", "explain the parser");
+    const v = handleAnswer({
+      chat_session_id: "chat-8",
+      temp_session_id: "temp-8",
+      token: "tok-opt",
+      answer: OPT_IN_NO,
+      rejected: false,
+    });
+    expect(v.verdict).toBe("cancel");
+    expect(v.data.delivered).toBe("original");
+    expect(h.calls.deliver).toHaveLength(1);
+    expect(h.calls.deliver[0].text).toBe("explain the parser");
+    expect(h.calls.dispatch).toHaveLength(0);
+    expect(h.calls.terminate).toContainEqual({ session_id: "temp-8" });
+    expect(h.store.has(`${BY_TEMP_COLLECTION}:temp-8`)).toBe(false);
+    expect(h.store.has(`${PENDING_COLLECTION}:chat-8`)).toBe(false);
+  });
+
+  it("opt-in dismissal (rejected) delivers the original", () => {
+    seedOptIn("temp-7", "chat-7", "do the thing");
+    const v = handleAnswer({
+      chat_session_id: "chat-7",
+      temp_session_id: "temp-7",
+      token: "tok-opt",
+      answer: "",
+      rejected: true,
+    });
+    expect(v.data.delivered).toBe("original");
+    expect(h.calls.deliver[0].text).toBe("do the thing");
+    expect(h.calls.dispatch).toHaveLength(0);
+  });
+
+  it("enrich proposes; approving delivers the hatched prompt once via the answer hook, then stops", () => {
     h.store.set(`${BY_TEMP_COLLECTION}:temp-1`, {
       chat_session_id: "chat-1",
       original_text: "fix the login bug",
+      history: "",
+      phase: PHASE_RESEARCH,
+      token: "",
     });
     h.store.set(`${PENDING_COLLECTION}:chat-1`, {
       temp_session_id: "temp-1",
@@ -305,48 +361,131 @@ describe("preHatchResult stops after generating the hatched prompt", () => {
     });
 
     // enrich: PROPOSES the expanded ("hatched") message. Nothing is delivered
-    // yet — only the approval card is raised.
-    const enriched =
-      "fix the login bug\n\n## Context (pre-gathered)\n- src/auth.rs:42";
+    // yet — only the approval card is raised, and by_temp now awaits approval.
+    const enriched = "fix the login bug\n\n## Context (pre-gathered)\n- src/auth.rs:42";
     const r1 = preHatchResult({ action: "enrich", message: enriched }, "temp-1");
     expect(r1.status).toBe("waiting_for_user");
     expect(h.calls.deliver).toHaveLength(0);
     expect(h.calls.ask).toHaveLength(1);
+    const rec = h.store.get(`${BY_TEMP_COLLECTION}:temp-1`) as any;
+    expect(rec.phase).toBe(PHASE_AWAIT_APPROVAL);
+    expect(rec.proposed_text).toBe(enriched);
+    expect(rec.token).toBe("tok-1");
 
-    // The user approves; finalize delivers the hatched prompt EXACTLY once.
-    h.calls.answer = { status: "answered", answer: APPROVE_SEND };
-    const r2 = preHatchResult({ action: "finalize" }, "temp-1");
-    expect(r2).toEqual({ ok: true, delivered: "enriched" });
+    // The user approves — the answer hook delivers the hatched prompt EXACTLY
+    // once, from the recorded answer, and stops the flow.
+    const v = handleAnswer({
+      chat_session_id: "chat-1",
+      temp_session_id: "temp-1",
+      token: "tok-1",
+      answer: APPROVE_SEND,
+      rejected: false,
+    });
+    expect(v.verdict).toBe("cancel");
+    expect(v.data.delivered).toBe("enriched");
     expect(h.calls.deliver).toHaveLength(1);
     expect(h.calls.deliver[0].text).toBe(enriched);
 
-    // STOPPED: both records cleared, and no further question or dispatch that
-    // could re-run the temp research agent.
+    // STOPPED: both records cleared, temp agent terminated, and no dispatch or
+    // second question that could re-run the temp research agent.
     expect(h.store.has(`${BY_TEMP_COLLECTION}:temp-1`)).toBe(false);
     expect(h.store.has(`${PENDING_COLLECTION}:chat-1`)).toBe(false);
-    expect(h.calls.ask).toHaveLength(1);
+    expect(h.calls.terminate).toContainEqual({ session_id: "temp-1" });
     expect(h.calls.dispatch).toHaveLength(0);
+    expect(h.calls.ask).toHaveLength(1);
+  });
 
-    // Re-entry is refused — the pre-hatch is truly finished, not looping.
-    expect(() => preHatchResult({ action: "finalize" }, "temp-1")).toThrow();
+  it("enrich then decline delivers the original, not the proposal", () => {
+    h.store.set(`${BY_TEMP_COLLECTION}:temp-2`, {
+      chat_session_id: "chat-2",
+      original_text: "add a flag",
+      phase: PHASE_RESEARCH,
+      token: "",
+    });
+    preHatchResult({ action: "enrich", message: "add a flag\n\n## Context\n- x" }, "temp-2");
+    const v = handleAnswer({
+      chat_session_id: "chat-2",
+      temp_session_id: "temp-2",
+      token: "tok-1",
+      answer: APPROVE_ORIGINAL,
+      rejected: false,
+    });
+    expect(v.data.delivered).toBe("original");
     expect(h.calls.deliver).toHaveLength(1);
+    expect(h.calls.deliver[0].text).toBe("add a flag");
   });
 
   it("pass delivers the original once and then stops", () => {
-    h.store.set(`${BY_TEMP_COLLECTION}:temp-2`, {
-      chat_session_id: "chat-2",
+    h.store.set(`${BY_TEMP_COLLECTION}:temp-3`, {
+      chat_session_id: "chat-3",
       original_text: "explain the parser",
+      phase: PHASE_RESEARCH,
+      token: "",
     });
-    h.store.set(`${PENDING_COLLECTION}:chat-2`, {
-      temp_session_id: "temp-2",
+    h.store.set(`${PENDING_COLLECTION}:chat-3`, {
+      temp_session_id: "temp-3",
       original_text: "explain the parser",
       created_ms: 1000,
     });
-    const r = preHatchResult({ action: "pass" }, "temp-2");
+    const r = preHatchResult({ action: "pass" }, "temp-3");
     expect(r).toEqual({ ok: true, delivered: "original" });
     expect(h.calls.deliver).toHaveLength(1);
     expect(h.calls.dispatch).toHaveLength(0);
-    expect(h.store.has(`${BY_TEMP_COLLECTION}:temp-2`)).toBe(false);
-    expect(h.store.has(`${PENDING_COLLECTION}:chat-2`)).toBe(false);
+    expect(h.store.has(`${BY_TEMP_COLLECTION}:temp-3`)).toBe(false);
+    expect(h.store.has(`${PENDING_COLLECTION}:chat-3`)).toBe(false);
+  });
+
+  it("a clarifying answer is left for core to resume the research agent (skip)", () => {
+    h.store.set(`${BY_TEMP_COLLECTION}:temp-6`, {
+      chat_session_id: "chat-6",
+      original_text: "q",
+      history: "h",
+      phase: PHASE_AWAIT_CLARIFY,
+      token: "tok-ask",
+    });
+    const v = handleAnswer({
+      chat_session_id: "chat-6",
+      temp_session_id: "temp-6",
+      token: "tok-ask",
+      answer: "some option",
+      rejected: false,
+    });
+    expect(v.verdict).toBe("skip");
+    expect(h.calls.deliver).toHaveLength(0);
+    const rec = h.store.get(`${BY_TEMP_COLLECTION}:temp-6`) as any;
+    expect(rec.phase).toBe(PHASE_RESEARCH);
+  });
+
+  it("owns an answer with no pending record so core never resumes a stale temp agent", () => {
+    const v = handleAnswer({
+      chat_session_id: "chat-x",
+      temp_session_id: "temp-x",
+      token: "t",
+      answer: OPT_IN_YES,
+      rejected: false,
+    });
+    expect(v.verdict).toBe("cancel");
+    expect(v.data.delivered).toBe("none");
+    expect(h.calls.deliver).toHaveLength(0);
+    expect(h.calls.dispatch).toHaveLength(0);
+  });
+
+  it("ignores a stale answer whose token no longer matches the outstanding question", () => {
+    h.store.set(`${BY_TEMP_COLLECTION}:temp-5`, {
+      chat_session_id: "chat-5",
+      original_text: "q",
+      phase: PHASE_AWAIT_APPROVAL,
+      proposed_text: "q\n\n## Context",
+      token: "current",
+    });
+    const v = handleAnswer({
+      chat_session_id: "chat-5",
+      temp_session_id: "temp-5",
+      token: "stale",
+      answer: APPROVE_SEND,
+      rejected: false,
+    });
+    expect(v.verdict).toBe("cancel");
+    expect(h.calls.deliver).toHaveLength(0);
   });
 });

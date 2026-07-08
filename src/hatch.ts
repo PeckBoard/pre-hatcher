@@ -1,36 +1,35 @@
 // The pre-hatch flow. Pure decision/formatting helpers are exported for
-// vitest; everything touching host functions stays in the two handlers.
+// vitest; everything touching host functions stays in the handlers.
 //
-// Flow:
+// Flow (every control-flow decision is made in CODE — the cheap model only
+// does read-only research):
 //  1. `session.message.before` fires for an interactive chat message. If the
 //     session's provider has a cheaper model (or the user picked an override
 //     in Settings) and no pre-hatch is already pending, create a temp
-//     research session on that model, dispatch the GATEKEEPER prompt (which
-//     holds until the user opts in), and raise the plugin-authored (no AI)
-//     opt-in question on the chat session. The answer is redirected to the
-//     temp session — core resumes a question's target directly and never
-//     re-fires this hook for it, so the temp agent is the only place the
-//     answer can be acted on. Cancel the hook — core parks the message as a
+//     research session on that model (idle — NOT dispatched yet) and raise the
+//     plugin-authored (no AI) opt-in question on the chat session, redirected
+//     to the temp session. Cancel the hook — core parks the message as a
 //     `pre-hatch` placeholder event. The cancel verdict carries
 //     `{temp_session_id, model}` so the UI can stream the temp session's
 //     actions into the parked bubble.
-//  2. The user's answer resumes the temp session. A decline (or dismissal)
-//     makes the agent call `pre_hatch_result` with `pass` immediately, so
-//     the original message is delivered untouched; an accept starts the
-//     research.
-//  3. The temp agent researches the repo and calls the `pre_hatch_result`
-//     MCP tool: `pass` delivers the original message, `enrich` PROPOSES the
-//     context-enriched message, `ask` raises ONE clarifying question on the
-//     chat session (the answer redirects back to the temp session, which then
-//     finishes with enrich/pass).
-//  4. An enrich proposal is never delivered directly: the plugin raises a
-//     plugin-authored (no AI) approval card on the chat session showing the
-//     expanded text, answer redirected to the temp session again. The temp
-//     agent's only remaining job is to call `finalize`; the plugin reads the
-//     user's RECORDED answer via `peckboard_get_answer` (core is the source
-//     of truth — the agent cannot forge approval or alter the text) and
-//     delivers the stored expanded message on approval, the original
-//     otherwise.
+//  2. The user answers the opt-in. Core fires `session.prehatch.answer` (the
+//     redirect target is a pre-hatcher session) and this plugin decides in
+//     CODE, never by handing the yes/no to the model:
+//       - decline / dismiss → deliver the original message untouched, done.
+//       - accept → dispatch the read-only research prompt to the temp session.
+//     Returning `cancel` tells core NOT to resume the temp agent with the raw
+//     answer text.
+//  3. The temp agent researches the repo and calls the `pre_hatch_result` MCP
+//     tool: `pass` delivers the original; `enrich` PROPOSES a context-enriched
+//     message (a plugin-authored approval card is raised, redirected to the
+//     temp session); `ask` raises ONE clarifying question (redirected to the
+//     temp session so the agent can read the answer and continue).
+//  4. The user answers the approval card → `session.prehatch.answer` fires
+//     again and this plugin delivers the enriched-or-original message in CODE,
+//     strictly from the recorded answer core passes in the hook (the agent
+//     cannot forge approval or alter the text), then terminates the temp
+//     agent. A clarifying answer instead falls through (verdict `skip`) so
+//     core resumes the research agent with it.
 //  5. Delivery goes through `peckboard_deliver_message`, which persists the
 //     final `user` event (carrying `pre_hatch: {original, enriched}` so the
 //     UI swaps the placeholder for it), broadcasts, and resumes the chat.
@@ -41,7 +40,6 @@ import {
   deliverMessage,
   dispatchCapture,
   genId,
-  getAnswer,
   nowMs,
   sessionMetaSet,
   storeDelete,
@@ -52,9 +50,18 @@ import {
 import { truncate } from "./verdict";
 
 /// Store collections: `pending` is keyed by CHAT session id, `by_temp` by the
-/// temp research session id (the reverse link the tool handler resolves).
+/// temp research session id (the reverse link the tool + answer handlers
+/// resolve).
 export const PENDING_COLLECTION = "pending";
 export const BY_TEMP_COLLECTION = "by_temp";
+
+/// The `by_temp` record's `phase` — which question (if any) is currently
+/// outstanding for the temp session, so `handleAnswer` knows how to resolve
+/// the user's answer in code.
+export const PHASE_OPT_IN = "opt_in";
+export const PHASE_RESEARCH = "research";
+export const PHASE_AWAIT_APPROVAL = "await_approval";
+export const PHASE_AWAIT_CLARIFY = "await_clarify";
 
 /// A pending record older than this is treated as dead (temp agent crashed,
 /// never reported, or the opt-in question was dismissed by typing past it) —
@@ -63,8 +70,8 @@ export const BY_TEMP_COLLECTION = "by_temp";
 export const STALE_MS = 30 * 60 * 1000;
 
 /// The opt-in question card (plugin-authored, no AI involved). The option
-/// labels also appear verbatim in the answer text core delivers to the temp
-/// session, so `gatekeeperPrompt` branches on them — keep them in sync.
+/// labels are compared against the user's recorded answer in CODE (core
+/// passes the selected label into `session.prehatch.answer`).
 export const OPT_IN_QUESTION =
   "Expand this message with repository context before sending it to the main model?";
 export const OPT_IN_YES = "Yes, expand it";
@@ -72,7 +79,7 @@ export const OPT_IN_NO = "No, send as-is";
 
 /// The approval card raised when the temp agent proposes an enriched
 /// message (also plugin-authored, no AI). Delivery is decided ONLY from the
-/// user's answer recorded by core — never from the agent's claim.
+/// user's recorded answer core passes back — never from the agent's claim.
 export const APPROVE_SEND = "Send expanded message";
 export const APPROVE_ORIGINAL = "Send my original message";
 
@@ -169,6 +176,15 @@ export function cancelPlan(
   }
   return "deliver";
 }
+
+/// Whether the recorded answer to the enriched-message approval card is an
+/// explicit approval. `answer` is the selected option label core passes into
+/// `session.prehatch.answer`; a dismissal (`rejected`) or any other label
+/// falls back to delivering the original message.
+export function isApproved(answer: string, rejected: boolean): boolean {
+  return !rejected && answer === APPROVE_SEND;
+}
+
 /// The research prompt the temp session runs on the cheap model. The
 /// read-only rule is stated here for the model's benefit, but it is also
 /// ENFORCED by core: the MCP server refuses every mutating tool call from
@@ -231,36 +247,11 @@ export function researchPrompt(text: string, history = ""): string {
     "  (with line numbers), key functions/types, and constraints discovered.",
     "  Keep the context under ~400 words — distill, never dump. Context",
     "  only — never present your findings as changes you have made yourself.",
-    "  After you call enrich, the user is asked to approve the expanded",
-    "  message; the answer arrives as your next message. Respond by calling",
-    '  pre_hatch_result with {"action":"finalize"} and NOTHING else,',
-    "  whatever the answer says — the plugin reads the user's recorded",
-    "  answer itself and delivers the approved version.",
+    "  After you call enrich you are DONE: the user is asked to approve the",
+    "  expanded message and the plugin delivers the approved version (or the",
+    "  original) itself. End your turn — do NOT call pre_hatch_result again",
+    "  and do NOT keep working on the request.",
     "- Call pre_hatch_result EXACTLY once per turn, as your final action.",
-  ].join("\n");
-}
-
-/// The prompt the temp session is dispatched with while the user answers the
-/// opt-in question. The first turn must do NOTHING — the user may decline,
-/// and any research done before the answer would be wasted spend. The answer
-/// (redirected here by the question's `redirectSessionId`) arrives as the
-/// next message and either starts the research or reports `pass` so the
-/// original message is delivered untouched.
-export function gatekeeperPrompt(text: string, history = ""): string {
-  return [
-    "HOLD — do not start working yet. The user is being asked whether this",
-    "message should be expanded with repository context, and may decline.",
-    "THIS TURN: do NOT call pre_hatch_result and do NOT use any other tool —",
-    "reply with exactly: ok. Everything below applies only AFTER the user's",
-    "answer arrives as your next message:",
-    `- If the answer contains "${OPT_IN_YES}": follow the instructions below`,
-    "  from the beginning.",
-    `- If it contains "${OPT_IN_NO}", or the user dismissed the question, or`,
-    "  it is anything else: immediately call the `pre_hatch_result` MCP tool",
-    '  with {"action":"pass"} and do nothing else — the user\'s message must',
-    "  never be left undelivered.",
-    "",
-    researchPrompt(text, history),
   ].join("\n");
 }
 
@@ -278,27 +269,17 @@ export function approvalQuestion(proposed: string): string {
   ].join("\n");
 }
 
-/// Whether a `peckboard_get_answer` result is an explicit approval of the
-/// expanded message. Anything else — decline, dismissal, unknown token —
-/// falls back to delivering the original message.
-export function isApproved(got: any): boolean {
-  return (
-    got?.status === "answered" &&
-    got?.rejected !== true &&
-    got?.answer === APPROVE_SEND
-  );
-}
-
 // ── Handlers (host-touching) ───────────────────────────────────────────
 
 /// `session.message.before`: decide whether to take ownership of the turn.
 /// Returns a verdict object; `lib.ts` serializes it. A cancel carries `data`
 /// (temp session id + model) that core copies onto the `pre-hatch`
 /// placeholder event so the UI can follow the temp session live. The temp
-/// session is dispatched holding (see `gatekeeperPrompt`) and the opt-in
-/// question is raised on the chat session with the answer redirected to the
-/// temp session; no model does any work until the user accepts. Any internal
-/// failure falls back to `{skip}` so the user's message always proceeds.
+/// session is created idle (NOT dispatched) and the opt-in question is raised
+/// on the chat session, redirected to the temp session; no model does any work
+/// until the user accepts (`session.prehatch.answer` starts the research in
+/// code). Any internal failure falls back to `{skip}` so the user's message
+/// always proceeds.
 export function handleMessageBefore(payload: any): {
   verdict: string;
   reason?: string;
@@ -345,15 +326,17 @@ export function handleMessageBefore(payload: any): {
       session_id: tempId,
       data: { chat_session_id: sessionId, original_text: text },
     });
-    // Ask BEFORE storing the pending records or dispatching: if the question
-    // cannot be raised (e.g. headless — no live host), the throw lands in the
-    // catch below and the message dispatches normally, leaving nothing behind
-    // but an idle, never-dispatched temp session.
+    // Ask BEFORE storing the pending records: if the question cannot be raised
+    // (e.g. headless — no live host), the throw lands in the catch below and
+    // the message dispatches normally, leaving nothing behind but an idle,
+    // never-dispatched temp session. The token is stored so `handleAnswer` can
+    // match the opt-in answer core reports on `session.prehatch.answer`.
+    const optInToken = genId();
     askUser({
       session_id: sessionId,
       question: OPT_IN_QUESTION,
       options: [OPT_IN_YES, OPT_IN_NO],
-      token: genId(),
+      token: optInToken,
       redirect_session_id: tempId,
     });
     storePut({
@@ -364,9 +347,14 @@ export function handleMessageBefore(payload: any): {
     storePut({
       collection: BY_TEMP_COLLECTION,
       key: tempId,
-      data: { chat_session_id: sessionId, original_text: text },
+      data: {
+        chat_session_id: sessionId,
+        original_text: text,
+        history,
+        phase: PHASE_OPT_IN,
+        token: optInToken,
+      },
     });
-    dispatchCapture({ session_id: tempId, prompt: gatekeeperPrompt(text, history) });
     return {
       verdict: "cancel",
       reason: `pre-hatch offered: expands with context gathered on ${cheapModel} if accepted`,
@@ -376,6 +364,151 @@ export function handleMessageBefore(payload: any): {
     // Enrichment is best-effort; a failure must never eat the user's message.
     return { verdict: "skip" };
   }
+}
+
+/// `session.prehatch.answer`: the user answered a pre-hatcher question whose
+/// answer core would otherwise redirect to the temp research session. We
+/// resolve it in CODE and return `cancel` when we own the outcome (so core
+/// does NOT resume the temp agent with the raw answer), or `skip` to let core
+/// resume it (a clarifying answer the research agent must read). Payload:
+/// `{ chat_session_id, temp_session_id, token, answer, rejected }`.
+export function handleAnswer(payload: any): {
+  verdict: string;
+  reason?: string;
+  data?: any;
+} {
+  const tempId = asStr(payload?.temp_session_id);
+  const chatId = asStr(payload?.chat_session_id);
+  const token = asStr(payload?.token);
+  const answer = asStr(payload?.answer);
+  const rejected = payload?.rejected === true;
+  if (tempId === "") {
+    return { verdict: "skip" };
+  }
+  const link = tryGet(BY_TEMP_COLLECTION, tempId);
+  if (!link) {
+    // Nothing pending for this temp session — the flow already resolved.
+    // Own it so core doesn't resume a stale (possibly terminated) temp agent
+    // with the answer text, which is exactly the run-past-hand-off bug.
+    return {
+      verdict: "cancel",
+      reason: "no pre-hatch pending for this answer",
+      data: { delivered: "none" },
+    };
+  }
+  const recordedToken = asStr(link.token);
+  // A stale answer (an older, superseded question) must not drive the flow.
+  if (recordedToken !== "" && token !== "" && recordedToken !== token) {
+    return {
+      verdict: "cancel",
+      reason: "answer does not match the outstanding pre-hatch question",
+      data: { delivered: "none" },
+    };
+  }
+  const phase = asStr(link.phase);
+  const original = asStr(link.original_text);
+
+  if (phase === PHASE_OPT_IN) {
+    if (isOptInAccept(answer, rejected)) {
+      // Start the read-only research now — in code, not by resuming the temp
+      // agent with the raw "yes".
+      const history = asStr(link.history);
+      storePut({
+        collection: BY_TEMP_COLLECTION,
+        key: tempId,
+        data: {
+          chat_session_id: chatId,
+          original_text: original,
+          history,
+          phase: PHASE_RESEARCH,
+          token: "",
+        },
+      });
+      try {
+        dispatchCapture({ session_id: tempId, prompt: researchPrompt(original, history) });
+      } catch (_e) {
+        // Could not start research: deliver the original so the message is
+        // never lost.
+        deliverOriginal(chatId, tempId, original);
+        return {
+          verdict: "cancel",
+          reason: "pre-hatch research dispatch failed; original delivered",
+          data: { delivered: "original" },
+        };
+      }
+      return {
+        verdict: "cancel",
+        reason: "pre-hatch accepted: read-only research dispatched",
+        data: { dispatched: true },
+      };
+    }
+    // Decline or dismissal: deliver the original untouched, in code.
+    deliverOriginal(chatId, tempId, original);
+    return {
+      verdict: "cancel",
+      reason: "pre-hatch declined: original message delivered untouched",
+      data: { delivered: "original" },
+    };
+  }
+
+  if (phase === PHASE_AWAIT_APPROVAL) {
+    const proposed = asStr(link.proposed_text);
+    const approved = proposed !== "" && isApproved(answer, rejected);
+    const text = approved ? proposed : original;
+    try {
+      deliverMessage({
+        session_id: chatId,
+        text,
+        data: userEventData(text, original, approved, tempId),
+      });
+    } catch (_e) {
+      // Could not deliver: clear the records and stop the temp agent so the
+      // chat isn't left blocked or the research agent left running.
+      cleanup(chatId, tempId);
+      try { terminateAgent({ session_id: tempId }); } catch (_e2) { /* best-effort */ }
+      return {
+        verdict: "cancel",
+        reason: "pre-hatch approval delivery failed",
+        data: { delivered: "none" },
+      };
+    }
+    cleanup(chatId, tempId);
+    // Delivery from a hook does not auto-terminate the temp session (that only
+    // happens when the caller itself is the pre-hatcher, e.g. `pass`), so stop
+    // it explicitly — its work is over.
+    try { terminateAgent({ session_id: tempId }); } catch (_e) { /* best-effort */ }
+    return {
+      verdict: "cancel",
+      reason: approved ? "enriched message delivered" : "original message delivered",
+      data: { delivered: approved ? "enriched" : "original" },
+    };
+  }
+
+  if (phase === PHASE_AWAIT_CLARIFY) {
+    // The clarifying answer must reach the research agent so it can finish
+    // gathering context. Move back to the research phase and let core resume
+    // the temp session with the answer (skip = not owned).
+    storePut({
+      collection: BY_TEMP_COLLECTION,
+      key: tempId,
+      data: {
+        chat_session_id: chatId,
+        original_text: original,
+        history: asStr(link.history),
+        phase: PHASE_RESEARCH,
+        token: "",
+      },
+    });
+    return { verdict: "skip" };
+  }
+
+  // Any other phase (research in flight, unknown): own it so core doesn't
+  // resume the temp agent unexpectedly.
+  return {
+    verdict: "cancel",
+    reason: "no outstanding pre-hatch question for this answer",
+    data: { delivered: "none" },
+  };
 }
 
 /// `session.prehatch.cancel`: the user cancelled the pre-hatch parked on
@@ -428,7 +561,10 @@ export function handleHatchCancel(payload: any): {
     data: { delivered: "original" },
   };
 }
-/// The `pre_hatch_result` MCP tool, called by the temp research agent.
+
+/// The `pre_hatch_result` MCP tool, called by the temp research agent. It
+/// reports the research outcome; the enrich/ask APPROVAL decisions are made in
+/// code later (`handleAnswer`), never here from the agent's claim.
 export function preHatchResult(args: any, callerSessionId: string): any {
   const link = tryGet(BY_TEMP_COLLECTION, callerSessionId);
   if (!link) {
@@ -441,6 +577,8 @@ export function preHatchResult(args: any, callerSessionId: string): any {
   const action = asStr(args?.action);
 
   if (action === "pass") {
+    // Delivery from the temp session's own tool call auto-terminates it
+    // (core kills a pre-hatcher caller after `deliver_message`).
     deliverMessage({
       session_id: chatId,
       text: original,
@@ -457,8 +595,9 @@ export function preHatchResult(args: any, callerSessionId: string): any {
     }
     const finalText = finalEnriched(original, message);
     // Never deliver AI-generated text directly: store the proposal, raise a
-    // plugin-authored approval card on the chat session, and deliver from
-    // `finalize` based on the user's recorded answer.
+    // plugin-authored approval card on the chat session (redirected to this
+    // temp session so `session.prehatch.answer` fires), and deliver from the
+    // user's recorded answer in `handleAnswer`.
     const token = genId();
     storePut({
       collection: BY_TEMP_COLLECTION,
@@ -467,7 +606,8 @@ export function preHatchResult(args: any, callerSessionId: string): any {
         chat_session_id: chatId,
         original_text: original,
         proposed_text: finalText,
-        approval_token: token,
+        phase: PHASE_AWAIT_APPROVAL,
+        token,
       },
     });
     askUser({
@@ -481,10 +621,10 @@ export function preHatchResult(args: any, callerSessionId: string): any {
       ok: true,
       status: "waiting_for_user",
       note:
-        "The user is being asked to approve the expanded message; their " +
-        "answer arrives as your next message. Then call pre_hatch_result " +
-        'with {"action":"finalize"} and nothing else — the plugin reads the ' +
-        "user's recorded answer itself and delivers accordingly.",
+        "The user is being asked to approve the expanded message; the plugin " +
+        "delivers the approved version (or the original) itself once they " +
+        "answer. You are DONE — end your turn and do not call pre_hatch_result " +
+        "again.",
     };
   }
 
@@ -497,6 +637,17 @@ export function preHatchResult(args: any, callerSessionId: string): any {
       ? args.options.filter((o: any) => typeof o === "string")
       : [];
     const token = genId();
+    storePut({
+      collection: BY_TEMP_COLLECTION,
+      key: callerSessionId,
+      data: {
+        chat_session_id: chatId,
+        original_text: original,
+        history: asStr(link.history),
+        phase: PHASE_AWAIT_CLARIFY,
+        token,
+      },
+    });
     askUser({
       session_id: chatId,
       question,
@@ -513,38 +664,34 @@ export function preHatchResult(args: any, callerSessionId: string): any {
     };
   }
 
-  if (action === "finalize") {
-    const token = asStr(link.approval_token);
-    const proposed = asStr(link.proposed_text);
-    if (token === "" || proposed === "") {
-      throw new Error("nothing awaiting approval — call enrich first");
-    }
-    // The verdict comes from the chat session's event log, never from the
-    // agent: it cannot forge an approval or alter the delivered text.
-    const got = getAnswer({ token, session_id: chatId });
-    if (got?.status === "pending") {
-      return {
-        ok: false,
-        status: "pending",
-        note:
-          "The user has not answered yet; end your turn and call finalize " +
-          "when the answer arrives.",
-      };
-    }
-    const approved = isApproved(got);
-    const text = approved ? proposed : original;
+  throw new Error(
+    `unknown action '${action}' — expected pass | enrich | ask`,
+  );
+}
+
+/// Deliver the original message untouched, clear the records, and stop the
+/// temp agent. Used by the code-driven answer paths (a decline, or a research
+/// dispatch that failed), where delivery from a hook does not auto-terminate
+/// the temp session.
+function deliverOriginal(chatId: string, tempId: string, original: string): void {
+  try {
     deliverMessage({
       session_id: chatId,
-      text,
-      data: userEventData(text, original, approved, callerSessionId),
+      text: original,
+      data: userEventData(original, original, false, tempId),
     });
-    cleanup(chatId, callerSessionId);
-    return { ok: true, delivered: approved ? "enriched" : "original" };
+  } catch (_e) {
+    // best-effort — a delivery failure must not leave records dangling
   }
+  cleanup(chatId, tempId);
+  try { terminateAgent({ session_id: tempId }); } catch (_e) { /* best-effort */ }
+}
 
-  throw new Error(
-    `unknown action '${action}' — expected pass | enrich | ask | finalize`,
-  );
+/// Whether the recorded opt-in answer accepts expansion. A dismissal or any
+/// label other than the explicit yes declines (the message is delivered
+/// untouched).
+function isOptInAccept(answer: string, rejected: boolean): boolean {
+  return !rejected && answer === OPT_IN_YES;
 }
 
 function cleanup(chatId: string, tempId: string): void {

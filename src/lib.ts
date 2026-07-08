@@ -2,7 +2,7 @@
 // to its handler. The wasm export functions themselves live in `index.ts`.
 
 import { allow, cancel, skip } from "./verdict";
-import { handleHatchCancel, handleMessageBefore, preHatchResult } from "./hatch";
+import { handleAnswer, handleHatchCancel, handleMessageBefore, preHatchResult } from "./hatch";
 
 /// Dispatch a hook call to the right handler, returning a verdict JSON string.
 export function dispatch(hook: string, payload: any): string {
@@ -14,6 +14,10 @@ export function dispatch(hook: string, payload: any): string {
     case "session.prehatch.cancel": {
       const v = handleHatchCancel(payload);
       return v.verdict === "cancel" ? cancel(v.reason ?? "pre-hatch cancelled", v.data) : skip();
+    }
+    case "session.prehatch.answer": {
+      const v = handleAnswer(payload);
+      return v.verdict === "cancel" ? cancel(v.reason ?? "pre-hatch answer handled", v.data) : skip();
     }
     case "mcp.tool.invoke":
       return handleInvoke(payload);

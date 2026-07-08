@@ -3,8 +3,8 @@
 // require.
 
 const DESCRIPTION =
-  "Pre-hatcher: pre-warms chat messages before they reach the main model. Each intercepted message starts with a plain opt-in question card (no AI involved) — declining sends the message unchanged; accepting has a cheaper model gather repository context in a temp session, WITH THE FULL CHAT TRANSCRIPT in view. The research model runs under a configurable library system prompt (default 'fable 5'), always asks a clarifying question when the request is ambiguous, and proposes an enriched message that is delivered only after the user approves it on a second plain question card (declining delivers the original). An in-flight pre-hatch can be cancelled from its chat bubble: the research agent is stopped and the original message is sent untouched.";
-const VERSION = "0.4.0";
+  "Pre-hatcher: pre-warms chat messages before they reach the main model. Each intercepted message starts with a plain opt-in question card (no AI involved) — declining sends the message unchanged; accepting has a cheaper model gather repository context in a temp session, WITH THE FULL CHAT TRANSCRIPT in view. Every yes/no decision and the final delivery are handled in the plugin's own code (on the user's answer), never by the cheap model: the research model only gathers read-only context, always asks a clarifying question when the request is ambiguous, and proposes an enriched message that is delivered only after the user approves it on a second plain question card (declining delivers the original). An in-flight pre-hatch can be cancelled from its chat bubble: the research agent is stopped and the original message is sent untouched.";
+const VERSION = "0.5.0";
 const REPOSITORY = "https://github.com/PeckBoard/pre-hatcher";
 
 /// Build the manifest JSON string. `index.ts`'s `manifest()` export wraps this.
@@ -16,6 +16,7 @@ export function manifestJson(): string {
 
     hooks: [
       "session.message.before",
+      "session.prehatch.answer",
       "session.prehatch.cancel",
       "mcp.tool.invoke",
     ],
@@ -25,12 +26,12 @@ export function manifestJson(): string {
         name: "pre_hatch_result",
         title: "Report pre-hatch result",
         description:
-          "PRE-HATCHER RESEARCH SESSIONS ONLY: report the outcome of pre-warming a chat message. action=pass sends the user's message unchanged; action=enrich PROPOSES `message` (the original message verbatim plus a distilled context section) — the user is asked to approve it, and when their answer arrives as your next message you MUST finish with action=finalize, which delivers the expanded or original message strictly from the user's recorded answer; action=ask raises ONE clarifying question to the user — use it whenever the request is ambiguous in any way that changes what the main model would do; their answer arrives as your next message, then continue with enrich or pass. Call exactly once per turn, as your final action.",
+          "PRE-HATCHER RESEARCH SESSIONS ONLY: report the outcome of pre-warming a chat message. action=pass sends the user's message unchanged; action=enrich PROPOSES `message` (the original message verbatim plus a distilled context section) — the user is asked to approve it and the plugin delivers the expanded or original message itself, strictly from the user's recorded answer, so you are DONE after calling enrich (end your turn, do not keep working); action=ask raises ONE clarifying question to the user — use it whenever the request is ambiguous in any way that changes what the main model would do; their answer arrives as your next message, then continue with enrich or pass. Call exactly once per turn, as your final action.",
         input_schema: {
           type: "object",
           properties: {
             action: {
-              enum: ["pass", "enrich", "ask", "finalize"],
+              enum: ["pass", "enrich", "ask"],
               description: "What to do with the pre-warmed message.",
             },
             message: {
